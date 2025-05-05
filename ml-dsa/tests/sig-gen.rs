@@ -1,6 +1,6 @@
 use ml_dsa::*;
 
-use std::{fs::read_to_string, path::PathBuf};
+use std::{fs::read_to_string, iter, path::PathBuf};
 
 #[test]
 fn acvp_sig_gen() {
@@ -35,7 +35,7 @@ fn verify<P: MlDsaParams>(tc: &acvp::TestCase, deterministic: bool) {
     } else {
         B32::try_from(tc.rnd.as_slice()).unwrap()
     };
-    let sig = sk.sign_internal(&[&tc.message], &rnd);
+    let sig = sk.sign_internal(iter::once(tc.message.as_slice()), &rnd);
     let sig_bytes = sig.encode();
 
     assert_eq!(tc.signature.as_slice(), sig_bytes.as_slice());

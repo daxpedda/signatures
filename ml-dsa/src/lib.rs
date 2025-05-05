@@ -40,7 +40,10 @@ mod util;
 // TODO(RLB) Move module to an independent crate shared with ml_kem
 mod module_lattice;
 
-use core::convert::{AsRef, TryFrom, TryInto};
+use core::{
+    convert::{AsRef, TryFrom, TryInto},
+    iter,
+};
 use hybrid_array::{
     Array,
     typenum::{
@@ -162,10 +165,18 @@ where
 // This method takes a slice of slices so that we can accommodate the varying calculations (direct
 // for test vectors, 0... for sign/sign_deterministic, 1... for the pre-hashed version) without
 // having to allocate memory for components.
-fn message_representative(tr: &[u8], Mp: &[&[u8]]) -> B64 {
+fn message_representative<'a>(
+    tr: &[u8],
+    Mp1: &[&[u8]],
+    Mp2: impl Iterator<Item = &'a [u8]>,
+) -> B64 {
     let mut h = H::default().absorb(tr);
 
-    for m in Mp {
+    for m in Mp1 {
+        h = h.absorb(m);
+    }
+
+    for m in Mp2 {
         h = h.absorb(m);
     }
 
@@ -238,7 +249,7 @@ where
 /// only supports signing with an empty context string.
 impl<P: MlDsaParams> signature::Signer<Signature<P>> for KeyPair<P> {
     fn try_sign(&self, msg: &[u8]) -> Result<Signature<P>, Error> {
-        self.signing_key.sign_deterministic(msg, &[])
+        self.signing_key.sign_deterministic(iter::once(msg), &[])
     }
 }
 
@@ -339,15 +350,64 @@ impl<P: MlDsaParams> SigningKey<P> {
     /// and it does not separate the context string from the rest of the message.
     // Algorithm 7 ML-DSA.Sign_internal
     // TODO(RLB) Only expose based on a feature.  Tests need access, but normal code shouldn't.
-    pub fn sign_internal(&self, Mp: &[&[u8]], rnd: &B32) -> Signature<P>
-    where
-        P: MlDsaParams,
-    {
+    pub fn sign_internal<'a>(&self, Mp: impl Iterator<Item = &'a [u8]>, rnd: &B32) -> Signature<P> {
+        self.sign_internal_iter(&[], Mp, rnd)
+    }
+
+    /// This method reflects the randomized ML-DSA.Sign algorithm.
+    ///
+    /// # Errors
+    ///
+    /// This method will return an opaque error if the context string is more than 255 bytes long,
+    /// or if it fails to get enough randomness.
+    // Algorithm 2 ML-DSA.Sign
+    #[cfg(feature = "rand_core")]
+    pub fn sign_randomized<'a, R: RngCore + CryptoRng + ?Sized>(
+        &self,
+        M: impl Iterator<Item = &'a [u8]>,
+        ctx: &[u8],
+        rng: &mut R,
+    ) -> Result<Signature<P>, Error> {
+        if ctx.len() > 255 {
+            return Err(Error::new());
+        }
+
+        let mut rnd = B32::default();
+        rng.try_fill_bytes(&mut rnd).map_err(|_| Error::new())?;
+
+        Ok(self.sign_internal_iter(&[&[0, Truncate::truncate(ctx.len())], ctx], M, &rnd))
+    }
+
+    /// This method reflects the optional deterministic variant of the ML-DSA.Sign algorithm.
+    ///
+    /// # Errors
+    ///
+    /// This method will return an opaque error if the context string is more than 255 bytes long.
+    // Algorithm 2 ML-DSA.Sign (optional deterministic variant)
+    pub fn sign_deterministic<'a>(
+        &self,
+        M: impl Iterator<Item = &'a [u8]>,
+        ctx: &[u8],
+    ) -> Result<Signature<P>, Error> {
+        if ctx.len() > 255 {
+            return Err(Error::new());
+        }
+
+        let rnd = B32::default();
+        Ok(self.sign_internal_iter(&[&[0, Truncate::truncate(ctx.len())], ctx], M, &rnd))
+    }
+
+    fn sign_internal_iter<'a>(
+        &self,
+        Mp1: &[&[u8]],
+        Mp2: impl Iterator<Item = &'a [u8]>,
+        rnd: &B32,
+    ) -> Signature<P> {
         // Compute the message representative
         // XXX(RLB): This line incorporates some of the logic from ML-DSA.sign to avoid computing
         // the concatenated M'.
         // XXX(RLB) Should the API represent this as an input?
-        let mu = message_representative(&self.tr, Mp);
+        let mu = message_representative(&self.tr, Mp1, Mp2);
 
         // Compute the private random seed
         let rhopp: B64 = H::default()
@@ -398,47 +458,6 @@ impl<P: MlDsaParams> SigningKey<P> {
         unreachable!("Rejection sampling failed to find a valid signature");
     }
 
-    /// This method reflects the randomized ML-DSA.Sign algorithm.
-    ///
-    /// # Errors
-    ///
-    /// This method will return an opaque error if the context string is more than 255 bytes long,
-    /// or if it fails to get enough randomness.
-    // Algorithm 2 ML-DSA.Sign
-    #[cfg(feature = "rand_core")]
-    pub fn sign_randomized<R: RngCore + CryptoRng + ?Sized>(
-        &self,
-        M: &[u8],
-        ctx: &[u8],
-        rng: &mut R,
-    ) -> Result<Signature<P>, Error> {
-        if ctx.len() > 255 {
-            return Err(Error::new());
-        }
-
-        let mut rnd = B32::default();
-        rng.try_fill_bytes(&mut rnd).map_err(|_| Error::new())?;
-
-        let Mp = &[&[0], &[Truncate::truncate(ctx.len())], ctx, M];
-        Ok(self.sign_internal(Mp, &rnd))
-    }
-
-    /// This method reflects the optional deterministic variant of the ML-DSA.Sign algorithm.
-    ///
-    /// # Errors
-    ///
-    /// This method will return an opaque error if the context string is more than 255 bytes long.
-    // Algorithm 2 ML-DSA.Sign (optional deterministic variant)
-    pub fn sign_deterministic(&self, M: &[u8], ctx: &[u8]) -> Result<Signature<P>, Error> {
-        if ctx.len() > 255 {
-            return Err(Error::new());
-        }
-
-        let rnd = B32::default();
-        let Mp = &[&[0], &[Truncate::truncate(ctx.len())], ctx, M];
-        Ok(self.sign_internal(Mp, &rnd))
-    }
-
     /// Encode the key in a fixed-size byte array.
     // Algorithm 24 skEncode
     pub fn encode(&self) -> EncodedSigningKey<P>
@@ -482,7 +501,7 @@ impl<P: MlDsaParams> SigningKey<P> {
 /// string, use the [`SigningKey::sign_deterministic`] method.
 impl<P: MlDsaParams> signature::Signer<Signature<P>> for SigningKey<P> {
     fn try_sign(&self, msg: &[u8]) -> Result<Signature<P>, Error> {
-        self.sign_deterministic(msg, &[])
+        self.sign_deterministic(iter::once(msg), &[])
     }
 }
 
@@ -496,7 +515,7 @@ impl<P: MlDsaParams> signature::RandomizedSigner<Signature<P>> for SigningKey<P>
         rng: &mut impl CryptoRngCore,
         msg: &[u8],
     ) -> Result<Signature<P>, Error> {
-        self.sign_randomized(msg, &[], rng)
+        self.sign_randomized(iter::once(msg), &[], rng)
     }
 }
 
@@ -565,12 +584,37 @@ impl<P: MlDsaParams> VerifyingKey<P> {
     /// include the domain separator that distinguishes between the normal and pre-hashed cases,
     /// and it does not separate the context string from the rest of the message.
     // Algorithm 8 ML-DSA.Verify_internal
-    pub fn verify_internal(&self, Mp: &[&[u8]], sigma: &Signature<P>) -> bool
-    where
-        P: MlDsaParams,
-    {
+    pub fn verify_internal<'a>(
+        &self,
+        Mp: impl Iterator<Item = &'a [u8]>,
+        sigma: &Signature<P>,
+    ) -> bool {
+        self.verify_iter(&[], Mp, sigma)
+    }
+
+    /// This algorithm reflect the ML-DSA.Verify algorithm from FIPS 204.
+    // Algorithm 3 ML-DSA.Verify
+    pub fn verify_with_context<'a>(
+        &self,
+        M: impl Iterator<Item = &'a [u8]>,
+        ctx: &[u8],
+        sigma: &Signature<P>,
+    ) -> bool {
+        if ctx.len() > 255 {
+            return false;
+        }
+
+        self.verify_iter(&[&[0], &[Truncate::truncate(ctx.len())], ctx], M, sigma)
+    }
+
+    fn verify_iter<'a>(
+        &self,
+        Mp1: &[&[u8]],
+        Mp2: impl Iterator<Item = &'a [u8]>,
+        sigma: &Signature<P>,
+    ) -> bool {
         // Compute the message representative
-        let mu = message_representative(&self.tr, Mp);
+        let mu = message_representative(&self.tr, Mp1, Mp2);
 
         // Reconstruct w
         let c = sample_in_ball(&sigma.c_tilde, P::TAU);
@@ -590,17 +634,6 @@ impl<P: MlDsaParams> VerifyingKey<P> {
             .squeeze_new::<P::Lambda>();
 
         sigma.c_tilde == cp_tilde
-    }
-
-    /// This algorithm reflect the ML-DSA.Verify algorithm from FIPS 204.
-    // Algorithm 3 ML-DSA.Verify
-    pub fn verify_with_context(&self, M: &[u8], ctx: &[u8], sigma: &Signature<P>) -> bool {
-        if ctx.len() > 255 {
-            return false;
-        }
-
-        let Mp = &[&[0], &[Truncate::truncate(ctx.len())], ctx, M];
-        self.verify_internal(Mp, sigma)
     }
 
     fn encode_internal(rho: &B32, t1: &Vector<P::K>) -> EncodedVerifyingKey<P> {
@@ -625,7 +658,7 @@ impl<P: MlDsaParams> VerifyingKey<P> {
 
 impl<P: MlDsaParams> signature::Verifier<Signature<P>> for VerifyingKey<P> {
     fn verify(&self, msg: &[u8], signature: &Signature<P>) -> Result<(), Error> {
-        self.verify_with_context(msg, &[], signature)
+        self.verify_with_context(iter::once(msg), &[], signature)
             .then_some(())
             .ok_or(Error::new())
     }
@@ -878,7 +911,7 @@ mod test {
 
         let M = b"Hello world";
         let rnd = Array([0u8; 32]);
-        let sig = sk.sign_internal(&[M], &rnd);
+        let sig = sk.sign_internal(iter::once(M.as_slice()), &rnd);
         let sig_bytes = sig.encode();
         let sig2 = Signature::<P>::decode(&sig_bytes).unwrap();
         assert!(sig == sig2);
@@ -901,9 +934,9 @@ mod test {
 
         let M = b"Hello world";
         let rnd = Array([0u8; 32]);
-        let sig = sk.sign_internal(&[M], &rnd);
+        let sig = sk.sign_internal(iter::once(M.as_slice()), &rnd);
 
-        assert!(vk.verify_internal(&[M], &sig));
+        assert!(vk.verify_internal(iter::once(M.as_slice()), &sig));
     }
 
     #[test]
@@ -934,13 +967,13 @@ mod test {
 
             let M = b"Hello world";
             let rnd = Array([0u8; 32]);
-            let sig = sk.sign_internal(&[M], &rnd);
+            let sig = sk.sign_internal(core::iter::once(M.as_slice()), &rnd);
 
             let sig_enc = sig.encode();
             let sig_dec = Signature::<P>::decode(&sig_enc).unwrap();
 
             assert_eq!(sig_dec, sig);
-            assert!(vk.verify_internal(&[M], &sig_dec));
+            assert!(vk.verify_internal(iter::once(M.as_slice()), &sig_dec));
         }
     }
 

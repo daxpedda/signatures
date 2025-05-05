@@ -1,6 +1,6 @@
 use ml_dsa::*;
 
-use std::{fs::read_to_string, path::PathBuf};
+use std::{fs::read_to_string, iter, path::PathBuf};
 
 #[test]
 fn acvp_sig_ver() {
@@ -35,7 +35,7 @@ fn verify<P: MlDsaParams>(tg: &acvp::TestGroup, tc: &acvp::TestCase) {
 
     // Verify the signature if it successfully decoded
     let test_passed = sig
-        .map(|sig| vk.verify_internal(&[&tc.message], &sig))
+        .map(|sig| vk.verify_internal(iter::once(tc.message.as_slice()), &sig))
         .unwrap_or_default();
     assert_eq!(test_passed, tc.test_passed);
 }
