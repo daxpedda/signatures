@@ -174,14 +174,15 @@ where
 // This method takes a slice of slices so that we can accommodate the varying calculations (direct
 // for test vectors, 0... for sign/sign_deterministic, 1... for the pre-hashed version) without
 // having to allocate memory for components.
-fn message_representative(tr: &[u8], Mp: &[&[&[u8]]]) -> B64 {
-    let mut h = H::default().absorb(tr);
+fn message_representative(
+    tr: &[u8],
+    Mp: impl Fn(&mut Shake256) -> Result<(), Error>,
+) -> Result<B64, Error> {
+    let mut digest = Shake256::default().chain(tr);
+    Mp(&mut digest)?;
+    let mut h = H::pre_digest(digest);
 
-    for m in Mp.iter().copied().flatten() {
-        h = h.absorb(m);
-    }
-
-    h.squeeze_new()
+    Ok(h.squeeze_new())
 }
 
 /// An ML-DSA key pair
@@ -259,7 +260,16 @@ impl<P: MlDsaParams> Signer<Signature<P>> for KeyPair<P> {
 /// only supports signing with an empty context string.
 impl<P: MlDsaParams> MultipartSigner<Signature<P>> for KeyPair<P> {
     fn try_multipart_sign(&self, msg: &[&[u8]]) -> Result<Signature<P>, Error> {
-        self.signing_key.raw_sign_deterministic(msg, &[])
+        self.signing_key.raw_sign_deterministic(
+            |digest| {
+                for m in msg {
+                    digest.update(m);
+                }
+
+                Ok(())
+            },
+            &[],
+        )
     }
 }
 
@@ -384,14 +394,29 @@ impl<P: MlDsaParams> SigningKey<P> {
     /// and it does not separate the context string from the rest of the message.
     // Algorithm 7 ML-DSA.Sign_internal
     // TODO(RLB) Only expose based on a feature.  Tests need access, but normal code shouldn't.
+    #[allow(clippy::missing_panics_doc)]
     pub fn sign_internal(&self, Mp: &[&[u8]], rnd: &B32) -> Signature<P>
     where
         P: MlDsaParams,
     {
-        self.raw_sign_internal(&[Mp], rnd)
+        self.raw_sign_internal(
+            |digest| {
+                for m in Mp {
+                    digest.update(m);
+                }
+
+                Ok(())
+            },
+            rnd,
+        )
+        .unwrap()
     }
 
-    fn raw_sign_internal(&self, Mp: &[&[&[u8]]], rnd: &B32) -> Signature<P>
+    fn raw_sign_internal(
+        &self,
+        Mp: impl Fn(&mut Shake256) -> Result<(), Error>,
+        rnd: &B32,
+    ) -> Result<Signature<P>, Error>
     where
         P: MlDsaParams,
     {
@@ -399,8 +424,8 @@ impl<P: MlDsaParams> SigningKey<P> {
         // XXX(RLB): This line incorporates some of the logic from ML-DSA.sign to avoid computing
         // the concatenated M'.
         // XXX(RLB) Should the API represent this as an input?
-        let mu = message_representative(&self.tr, Mp);
-        self.raw_sign_mu(&mu, rnd)
+        let mu = message_representative(&self.tr, Mp)?;
+        Ok(self.raw_sign_mu(&mu, rnd))
     }
 
     fn raw_sign_mu(&self, mu: &B64, rnd: &B32) -> Signature<P>
@@ -506,7 +531,13 @@ impl<P: MlDsaParams> SigningKey<P> {
     /// This method will return an opaque error if the context string is more than 255 bytes long.
     // Algorithm 2 ML-DSA.Sign (optional deterministic variant)
     pub fn sign_deterministic(&self, M: &[u8], ctx: &[u8]) -> Result<Signature<P>, Error> {
-        self.raw_sign_deterministic(&[M], ctx)
+        self.raw_sign_deterministic(
+            |digest| {
+                digest.update(M);
+                Ok(())
+            },
+            ctx,
+        )
     }
 
     /// This method reflects the optional deterministic variant of the ML-DSA.Sign algorithm with a
@@ -517,14 +548,26 @@ impl<P: MlDsaParams> SigningKey<P> {
         self.raw_sign_mu(mu, &rnd)
     }
 
-    fn raw_sign_deterministic(&self, M: &[&[u8]], ctx: &[u8]) -> Result<Signature<P>, Error> {
+    fn raw_sign_deterministic(
+        &self,
+        M: impl Fn(&mut Shake256) -> Result<(), Error>,
+        ctx: &[u8],
+    ) -> Result<Signature<P>, Error> {
         if ctx.len() > 255 {
             return Err(Error::new());
         }
 
         let rnd = B32::default();
-        let Mp = &[&[&[0], &[Truncate::truncate(ctx.len())], ctx], M];
-        Ok(self.raw_sign_internal(Mp, &rnd))
+        self.raw_sign_internal(
+            |digest| {
+                digest.update(&[0]);
+                digest.update(&[Truncate::truncate(ctx.len())]);
+                digest.update(ctx);
+
+                M(digest)
+            },
+            &rnd,
+        )
     }
 
     /// Encode the key in a fixed-size byte array.
@@ -596,7 +639,16 @@ impl<P: MlDsaParams> Signer<Signature<P>> for SigningKey<P> {
 /// string, use the [`SigningKey::sign_deterministic`] method.
 impl<P: MlDsaParams> MultipartSigner<Signature<P>> for SigningKey<P> {
     fn try_multipart_sign(&self, msg: &[&[u8]]) -> Result<Signature<P>, Error> {
-        self.raw_sign_deterministic(msg, &[])
+        self.raw_sign_deterministic(
+            |digest| {
+                for m in msg {
+                    digest.update(m);
+                }
+
+                Ok(())
+            },
+            &[],
+        )
     }
 }
 
@@ -608,11 +660,7 @@ impl<P: MlDsaParams> DigestSigner<Shake256, Signature<P>> for SigningKey<P> {
         &self,
         f: F,
     ) -> Result<Signature<P>, Error> {
-        let mut digest = Shake256::default().chain(self.tr).chain([0, 0]);
-        f(&mut digest)?;
-        let mu = H::pre_digest(digest).squeeze_new();
-
-        Ok(self.sign_mu_deterministic(&mu))
+        self.raw_sign_deterministic(f, &[])
     }
 }
 
@@ -736,20 +784,35 @@ impl<P: MlDsaParams> VerifyingKey<P> {
     /// include the domain separator that distinguishes between the normal and pre-hashed cases,
     /// and it does not separate the context string from the rest of the message.
     // Algorithm 8 ML-DSA.Verify_internal
+    #[allow(clippy::missing_panics_doc)]
     pub fn verify_internal(&self, Mp: &[&[u8]], sigma: &Signature<P>) -> bool
     where
         P: MlDsaParams,
     {
-        self.raw_verify_internal(&[Mp], sigma)
+        self.raw_verify_internal(
+            |digest| {
+                for m in Mp {
+                    digest.update(m);
+                }
+
+                Ok(())
+            },
+            sigma,
+        )
+        .unwrap()
     }
 
-    fn raw_verify_internal(&self, Mp: &[&[&[u8]]], sigma: &Signature<P>) -> bool
+    fn raw_verify_internal(
+        &self,
+        Mp: impl Fn(&mut Shake256) -> Result<(), Error>,
+        sigma: &Signature<P>,
+    ) -> Result<bool, Error>
     where
         P: MlDsaParams,
     {
         // Compute the message representative
-        let mu = message_representative(&self.tr, Mp);
-        self.raw_verify_mu(&mu, sigma)
+        let mu = message_representative(&self.tr, Mp)?;
+        Ok(self.raw_verify_mu(&mu, sigma))
     }
 
     fn raw_verify_mu(&self, mu: &B64, sigma: &Signature<P>) -> bool
@@ -778,8 +841,17 @@ impl<P: MlDsaParams> VerifyingKey<P> {
 
     /// This algorithm reflects the ML-DSA.Verify algorithm from FIPS 204.
     // Algorithm 3 ML-DSA.Verify
+    #[allow(clippy::missing_panics_doc)]
     pub fn verify_with_context(&self, M: &[u8], ctx: &[u8], sigma: &Signature<P>) -> bool {
-        self.raw_verify_with_context(&[M], ctx, sigma)
+        self.raw_verify_with_context(
+            |digest| {
+                digest.update(M);
+                Ok(())
+            },
+            ctx,
+            sigma,
+        )
+        .unwrap()
     }
 
     /// This algorithm reflects the ML-DSA.Verify algorithm with a pre-computed μ from FIPS 204.
@@ -788,13 +860,26 @@ impl<P: MlDsaParams> VerifyingKey<P> {
         self.raw_verify_mu(mu, sigma)
     }
 
-    fn raw_verify_with_context(&self, M: &[&[u8]], ctx: &[u8], sigma: &Signature<P>) -> bool {
+    fn raw_verify_with_context(
+        &self,
+        M: impl Fn(&mut Shake256) -> Result<(), Error>,
+        ctx: &[u8],
+        sigma: &Signature<P>,
+    ) -> Result<bool, Error> {
         if ctx.len() > 255 {
-            return false;
+            return Ok(false);
         }
 
-        let Mp = &[&[&[0], &[Truncate::truncate(ctx.len())], ctx], M];
-        self.raw_verify_internal(Mp, sigma)
+        self.raw_verify_internal(
+            |digest| {
+                digest.update(&[0]);
+                digest.update(&[Truncate::truncate(ctx.len())]);
+                digest.update(ctx);
+
+                M(digest)
+            },
+            sigma,
+        )
     }
 
     fn encode_internal(rho: &B32, t1: &Vector<P::K>) -> EncodedVerifyingKey<P> {
@@ -825,9 +910,20 @@ impl<P: MlDsaParams> signature::Verifier<Signature<P>> for VerifyingKey<P> {
 
 impl<P: MlDsaParams> MultipartVerifier<Signature<P>> for VerifyingKey<P> {
     fn multipart_verify(&self, msg: &[&[u8]], signature: &Signature<P>) -> Result<(), Error> {
-        self.raw_verify_with_context(msg, &[], signature)
-            .then_some(())
-            .ok_or(Error::new())
+        self.raw_verify_with_context(
+            |digest| {
+                for m in msg {
+                    digest.update(m);
+                }
+
+                Ok(())
+            },
+            &[],
+            signature,
+        )
+        .unwrap()
+        .then_some(())
+        .ok_or(Error::new())
     }
 }
 
